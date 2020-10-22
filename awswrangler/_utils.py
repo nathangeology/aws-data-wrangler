@@ -14,8 +14,9 @@ import boto3
 import botocore.config
 import numpy as np
 import pandas as pd
+import psycopg2
 
-from awswrangler import _config, exceptions
+from awswrangler import exceptions
 
 _logger: logging.Logger = logging.getLogger(__name__)
 
@@ -64,44 +65,14 @@ def botocore_config() -> botocore.config.Config:
     return botocore.config.Config(retries={"max_attempts": 5}, connect_timeout=10, max_pool_connections=10)
 
 
-def _get_endpoint_url(service_name: str) -> Optional[str]:
-    endpoint_url: Optional[str] = None
-    if service_name == "s3" and _config.config.s3_endpoint_url is not None:
-        endpoint_url = _config.config.s3_endpoint_url
-    elif service_name == "athena" and _config.config.athena_endpoint_url is not None:
-        endpoint_url = _config.config.athena_endpoint_url
-    elif service_name == "sts" and _config.config.sts_endpoint_url is not None:
-        endpoint_url = _config.config.sts_endpoint_url
-    elif service_name == "glue" and _config.config.glue_endpoint_url is not None:
-        endpoint_url = _config.config.glue_endpoint_url
-    elif service_name == "redshift" and _config.config.redshift_endpoint_url is not None:
-        endpoint_url = _config.config.redshift_endpoint_url
-    elif service_name == "kms" and _config.config.kms_endpoint_url is not None:
-        endpoint_url = _config.config.kms_endpoint_url
-    elif service_name == "emr" and _config.config.emr_endpoint_url is not None:
-        endpoint_url = _config.config.emr_endpoint_url
-    return endpoint_url
-
-
-def client(
-    service_name: str, session: Optional[boto3.Session] = None, config: Optional[botocore.config.Config] = None
-) -> boto3.client:
+def client(service_name: str, session: Optional[boto3.Session] = None) -> boto3.client:
     """Create a valid boto3.client."""
-    endpoint_url: Optional[str] = _get_endpoint_url(service_name=service_name)
-    return ensure_session(session=session).client(
-        service_name=service_name,
-        endpoint_url=endpoint_url,
-        use_ssl=True,
-        config=botocore_config() if config is None else config,
-    )
+    return ensure_session(session=session).client(service_name=service_name, use_ssl=False, config=botocore_config())
 
 
 def resource(service_name: str, session: Optional[boto3.Session] = None) -> boto3.resource:
     """Create a valid boto3.resource."""
-    endpoint_url: Optional[str] = _get_endpoint_url(service_name=service_name)
-    return ensure_session(session=session).resource(
-        service_name=service_name, endpoint_url=endpoint_url, use_ssl=True, config=botocore_config()
-    )
+    return ensure_session(session=session).resource(service_name=service_name, use_ssl=False, config=botocore_config())
 
 
 def parse_path(path: str) -> Tuple[str, str]:
@@ -129,8 +100,6 @@ def parse_path(path: str) -> Tuple[str, str]:
         raise exceptions.InvalidArgumentValue(f"'{path}' is not a valid path. It MUST start with 's3://'")
     parts = path.replace("s3://", "").split("/", 1)
     bucket: str = parts[0]
-    if "/" in bucket:
-        raise exceptions.InvalidArgumentValue(f"'{bucket}' is not a valid bucket name.")
     key: str = ""
     if len(parts) == 2:
         key = key if parts[1] is None else parts[1]
@@ -209,6 +178,14 @@ def empty_generator() -> Generator[None, None, None]:
     yield from ()
 
 
+def ensure_postgresql_casts() -> None:
+    """Ensure that psycopg2 will handle some data types right."""
+    psycopg2.extensions.register_adapter(bytes, psycopg2.Binary)
+    typecast_bytea = lambda data, cur: None if data is None else bytes(psycopg2.BINARY(data, cur))  # noqa
+    BYTEA = psycopg2.extensions.new_type(psycopg2.BINARY.values, "BYTEA", typecast_bytea)
+    psycopg2.extensions.register_type(BYTEA)
+
+
 def get_directory(path: str) -> str:
     """Extract directory path."""
     return path.rsplit(sep="/", maxsplit=1)[0] + "/"
@@ -232,20 +209,8 @@ def get_region_from_session(boto3_session: Optional[boto3.Session] = None, defau
     raise exceptions.InvalidArgument("There is no region_name defined on boto3, please configure it.")
 
 
-def get_credentials_from_session(
-    boto3_session: Optional[boto3.Session] = None,
-) -> botocore.credentials.ReadOnlyCredentials:
-    """Get AWS credentials from boto3 session."""
-    session: boto3.Session = ensure_session(session=boto3_session)
-    credentials: botocore.credentials.Credentials = session.get_credentials()
-    frozen_credentials: botocore.credentials.ReadOnlyCredentials = credentials.get_frozen_credentials()
-    return frozen_credentials
-
-
 def list_sampling(lst: List[Any], sampling: float) -> List[Any]:
     """Random List sampling."""
-    if sampling == 1.0:
-        return lst
     if sampling > 1.0 or sampling <= 0.0:
         raise exceptions.InvalidArgumentValue(f"Argument <sampling> must be [0.0 < value <= 1.0]. {sampling} received.")
     _len: int = len(lst)
@@ -257,9 +222,7 @@ def list_sampling(lst: List[Any], sampling: float) -> List[Any]:
     _logger.debug("_len: %s", _len)
     _logger.debug("sampling: %s", sampling)
     _logger.debug("num_samples: %s", num_samples)
-    random_lst: List[Any] = random.sample(population=lst, k=num_samples)
-    random_lst.sort()
-    return random_lst
+    return random.sample(population=lst, k=num_samples)
 
 
 def ensure_df_is_mutable(df: pd.DataFrame) -> pd.DataFrame:
@@ -271,6 +234,12 @@ def ensure_df_is_mutable(df: pd.DataFrame) -> pd.DataFrame:
                 df[column] = None
                 df[column] = s
     return df
+
+
+def insert_str(text: str, token: str, insert: str) -> str:
+    """Insert string into other."""
+    index: int = text.find(token)
+    return text[:index] + insert + text[index:]
 
 
 def check_duplicated_columns(df: pd.DataFrame) -> Any:
@@ -286,14 +255,7 @@ def check_duplicated_columns(df: pd.DataFrame) -> Any:
         )
 
 
-def try_it(
-    f: Callable[..., Any],
-    ex: Any,
-    ex_code: Optional[str] = None,
-    base: float = 1.0,
-    max_num_tries: int = 3,
-    **kwargs: Any,
-) -> Any:
+def try_it(f: Callable[..., Any], ex: Any, base: float = 1.0, max_num_tries: int = 3, **kwargs: Any) -> Any:
     """Run function with decorrelated Jitter.
 
     Reference: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
@@ -303,11 +265,8 @@ def try_it(
         try:
             return f(**kwargs)
         except ex as exception:
-            if ex_code is not None and hasattr(exception, "response"):
-                if exception.response["Error"]["Code"] != ex_code:
-                    raise
             if i == (max_num_tries - 1):
-                raise
+                raise exception
             delay = random.uniform(base, delay * 3)
             _logger.error("Retrying %s | Fail number %s/%s | Exception: %s", f, i + 1, max_num_tries, exception)
             time.sleep(delay)
